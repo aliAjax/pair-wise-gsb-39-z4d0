@@ -14,7 +14,9 @@ python app.py --port 8010
 ## 业务能力
 
 - 基础数据导入会一次性检查线路、站点经纬度、连续站序、重复站点、站间行驶时间和班次时间。错误批次写入 `import_errors` 后整体拒绝，不留下半批数据。
-- 中断事件可以包含 `stop_closure`、`skip_stop`、`detour`、`accessibility_change`，可以设置服务日分钟窗口。
+- 中断事件可以包含 `stop_closure`、`skip_stop`、`detour`、`accessibility_change`、`station_relocation`，可以设置服务日分钟窗口。
+- 站点迁移登记原站、临时站点、步行分钟和生效窗口。窗口内原站封闭、线路在原站位置改停临时站点，路径查询会把原站到临时站点的步行分钟计入总耗时和到达时间；窗口结束后自动恢复原站停靠。同一原站的迁移窗口不允许重叠。
+- 临时站点不具备无障碍条件时，无障碍查询仍给出这条步行绕行路线（施工期间唯一可走方案），并在步行段标注 `warning`；临时站点作为普通站点所属的其他线路仍按无障碍规则过滤。
 - 路径使用 Dijkstra 算法比较基线与方案版本；跳站时车辆可继续通过，但乘客不能在跳站上下车，经过省略路段的行驶时间会计入下一段。
 - 班次时间以服务日零点起算，允许超过 1440 分钟。例如 1430 分发车、21 分钟到达会显示为次日 `00:21`。
 - 修改只允许发生在草稿版本；创建新版本会复制父版本变更，已发布快照继续保留。
@@ -27,7 +29,7 @@ python app.py --port 8010
 - `POST /api/import`：导入基础数据。
 - `POST /api/disruptions`：创建中断事件及第一版草稿。
 - `POST /api/disruptions/{id}/versions`：从指定父版本复制出新草稿。
-- `POST /api/versions/{id}/changes`：向草稿添加停运、跳站、绕行或无障碍变化。
+- `POST /api/versions/{id}/changes`：向草稿添加停运、跳站、绕行、无障碍变化或站点迁移（`station_relocation` 需 `stop_id` 原站、`to_stop_id` 临时站点、`travel_minutes` 步行分钟和生效窗口）。
 - `POST /api/versions/{id}/submit|approve|reject|publish`：完成复核发布流程。
 - `GET /api/route?from=1&to=5&version_id=1&at_minute=1430&accessible=true`：查询路径、耗时和到达时间。
 - `GET /api/trips/{id}`：查看跨日班次各站时间。
@@ -39,4 +41,4 @@ python app.py --port 8010
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖基线/改道路径、版本复制与发布隔离、审批冲突、无障碍路径、跨日时刻和坏数据整批隔离。
+测试覆盖基线/改道路径、版本复制与发布隔离、审批冲突、无障碍路径、跨日时刻、坏数据整批隔离，以及站点迁移的窗口步行计入、到点恢复、无障碍可走路线和登记校验。

@@ -120,7 +120,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS changes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
-                    kind TEXT NOT NULL CHECK(kind IN ('stop_closure','skip_stop','detour','accessibility_change')),
+                    kind TEXT NOT NULL CHECK(kind IN ('stop_closure','skip_stop','detour','accessibility_change','station_relocation')),
                     line_id INTEGER REFERENCES lines(id),
                     stop_id INTEGER REFERENCES stops(id),
                     from_stop_id INTEGER REFERENCES stops(id),
@@ -151,6 +151,47 @@ class Database:
                 );
                 """
             )
+            self._migrate_changes(conn)
+
+    def _migrate_changes(self, conn: sqlite3.Connection) -> None:
+        """Rebuild the changes table when an existing database predates a kind.
+
+        SQLite cannot alter a CHECK constraint, so copy the rows into a fresh
+        table that also accepts station_relocation. Fresh databases already
+        have the new definition and skip this.
+        """
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='changes'").fetchone()
+        if row is None or "station_relocation" in row["sql"]:
+            return
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("ALTER TABLE changes RENAME TO changes_legacy")
+        conn.executescript(
+            """
+            CREATE TABLE changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK(kind IN ('stop_closure','skip_stop','detour','accessibility_change','station_relocation')),
+                line_id INTEGER REFERENCES lines(id),
+                stop_id INTEGER REFERENCES stops(id),
+                from_stop_id INTEGER REFERENCES stops(id),
+                to_stop_id INTEGER REFERENCES stops(id),
+                travel_minutes INTEGER,
+                effective_start_minute INTEGER,
+                effective_end_minute INTEGER,
+                accessible INTEGER,
+                payload TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """INSERT INTO changes(id,version_id,kind,line_id,stop_id,from_stop_id,to_stop_id,travel_minutes,
+                                 effective_start_minute,effective_end_minute,accessible,payload,created_at)
+               SELECT id,version_id,kind,line_id,stop_id,from_stop_id,to_stop_id,travel_minutes,
+                      effective_start_minute,effective_end_minute,accessible,payload,created_at FROM changes_legacy"""
+        )
+        conn.execute("DROP TABLE changes_legacy")
+        conn.execute("PRAGMA foreign_keys=ON")
 
     def _audit(self, conn: sqlite3.Connection, actor: str, action: str, entity_type: str,
                entity_id: int | None, details: dict[str, Any]) -> None:
@@ -298,7 +339,7 @@ class Database:
         if role not in {"planner", "editor", "admin"}:
             raise DomainError("没有修改方案的权限", 403)
         kind = str(payload.get("kind", "")).strip()
-        if kind not in {"stop_closure", "skip_stop", "detour", "accessibility_change"}:
+        if kind not in {"stop_closure", "skip_stop", "detour", "accessibility_change", "station_relocation"}:
             raise DomainError("变更类型不合法")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -323,6 +364,8 @@ class Database:
                 raise DomainError("该变更需要 stop_id")
             if kind == "detour" and (from_stop_id is None or to_stop_id is None or travel is None):
                 raise DomainError("绕行需要起止站点和行驶分钟数")
+            if kind == "station_relocation" and (stop_id is None or to_stop_id is None or travel is None):
+                raise DomainError("站点迁移需要原站、临时站点和步行分钟")
             if travel is not None and int(travel) < 0:
                 raise DomainError("行驶时间不能为负")
             if (start is None) != (end is None):
@@ -331,6 +374,18 @@ class Database:
                 start, end = int(start), int(end)
                 if start < 0 or end <= start or end >= 2880:
                     raise DomainError("生效时间范围不合法")
+            if kind == "station_relocation":
+                if int(stop_id) == int(to_stop_id):
+                    raise DomainError("原站和临时站点不能相同")
+                if start is None:
+                    raise DomainError("站点迁移需要登记生效窗口")
+                conflict = conn.execute(
+                    """SELECT 1 FROM changes WHERE version_id=? AND kind='station_relocation' AND stop_id=?
+                       AND effective_start_minute<? AND effective_end_minute>?""",
+                    (version_id, int(stop_id), int(end), int(start)),
+                ).fetchone()
+                if conflict:
+                    raise DomainError("同一原站在该生效窗口内已登记站点迁移", 409)
             accessible = payload.get("accessible")
             if kind == "accessibility_change" and not isinstance(accessible, bool):
                 raise DomainError("无障碍变更需要布尔值 accessible")
@@ -406,6 +461,7 @@ class Database:
             closed: set[int] = set()
             inaccessible: set[int] = set()
             detours: list[sqlite3.Row] = []
+            relocations: list[sqlite3.Row] = []
             for change in active:
                 if not _within_window(at_minute, change["effective_start_minute"], change["effective_end_minute"]):
                     continue
@@ -415,6 +471,16 @@ class Database:
                     inaccessible.add(int(change["stop_id"]))
                 elif change["kind"] == "detour":
                     detours.append(change)
+                elif change["kind"] == "station_relocation":
+                    relocations.append(change)
+            relocation_by_original: dict[int, sqlite3.Row] = {}
+            for change in relocations:
+                original = int(change["stop_id"])
+                relocation_by_original.setdefault(original, change)
+                # The original platform is sealed while the relocation window
+                # is active; outside the window the change is filtered out
+                # above and the original stop serves passengers again.
+                closed.add(original)
             graph: dict[int, list[tuple[int, int, dict[str, Any]]]] = {sid: [] for sid in stops}
             for line_id, rows in memberships.items():
                 if not rows:
@@ -422,18 +488,27 @@ class Database:
                 # Vehicles may pass a skipped or closed stop but passengers
                 # cannot board or alight there. Build one edge between each
                 # pair of usable stops and accumulate all omitted segment time.
-                usable = [
-                    row for row in rows
-                    if int(row["stop_id"]) not in closed
-                    and not (require_accessible and (not stops[int(row["stop_id"])]["accessible"] or int(row["stop_id"]) in inaccessible))
+                # A relocated stop is replaced by its temporary stop at the
+                # same sequence, so the line serves the temporary stop instead.
+                effective = [
+                    (int(relocation_by_original[int(row["stop_id"])]["to_stop_id"]) if int(row["stop_id"]) in relocation_by_original else int(row["stop_id"]), row)
+                    for row in rows
                 ]
-                for current, nxt in zip(usable, usable[1:]):
+                usable = [
+                    (stop_id, row) for stop_id, row in effective
+                    if stop_id not in closed
+                    and (int(row["stop_id"]) in relocation_by_original
+                         or not (require_accessible and (not stops[stop_id]["accessible"] or stop_id in inaccessible)))
+                ]
+                for (current_id, current), (next_id, nxt) in zip(usable, usable[1:]):
+                    if current_id == next_id:
+                        continue
                     between = [r for r in rows if int(current["sequence"]) < int(r["sequence"]) <= int(nxt["sequence"])]
                     minutes = sum(int(r["travel_minutes_from_previous"]) for r in between)
                     edge = {"line_id": line_id, "kind": "route", "from_sequence": current["sequence"], "to_sequence": nxt["sequence"]}
-                    graph[int(current["stop_id"])].append((int(nxt["stop_id"]), minutes, edge))
+                    graph[current_id].append((next_id, minutes, edge))
                     reverse_edge = {"line_id": line_id, "kind": "route", "from_sequence": nxt["sequence"], "to_sequence": current["sequence"]}
-                    graph[int(nxt["stop_id"])].append((int(current["stop_id"]), minutes, reverse_edge))
+                    graph[next_id].append((current_id, minutes, reverse_edge))
             for change in detours:
                 src, dst, minutes = int(change["from_stop_id"]), int(change["to_stop_id"]), int(change["travel_minutes"])
                 if src in closed or dst in closed:
@@ -442,6 +517,20 @@ class Database:
                     continue
                 graph[src].append((dst, minutes, {"line_id": change["line_id"], "kind": "detour", "change_id": change["id"]}))
                 graph[dst].append((src, minutes, {"line_id": change["line_id"], "kind": "detour", "change_id": change["id"]}))
+            for change in relocations:
+                original, temporary, minutes = int(change["stop_id"]), int(change["to_stop_id"]), int(change["travel_minutes"])
+                if temporary in closed:
+                    continue
+                # Walking link between the sealed original stop and its
+                # temporary replacement. It stays available to accessible
+                # queries even when the temporary stop lacks barrier-free
+                # facilities, so those passengers still get a walkable route;
+                # the leg then carries a warning.
+                edge: dict[str, Any] = {"line_id": None, "kind": "walk", "change_id": change["id"]}
+                if require_accessible and (not stops[temporary]["accessible"] or temporary in inaccessible):
+                    edge["warning"] = "临时站点不具备无障碍条件"
+                graph[original].append((temporary, minutes, edge))
+                graph[temporary].append((original, minutes, dict(edge)))
             return graph, stops
 
     def route(self, from_stop_id: int, to_stop_id: int, version_id: int | None = None,
