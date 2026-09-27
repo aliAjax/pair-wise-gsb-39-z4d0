@@ -1,14 +1,26 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>公交改道发布</title>
 <style>body{font:15px/1.5 system-ui,sans-serif;max-width:1080px;margin:32px auto;padding:0 18px}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}button{cursor:pointer}small{color:#667}</style></head>
-<body><h1>公共交通中断改道发布</h1><p>示例线路中 S1 到 S5 的基线路径耗时 23 分钟。新建临时停运方案后，可比较改道路径，并按草稿、复核、批准、发布流程处理。</p>
+<body><h1>公共交通中断改道发布</h1><p>示例线路中 S1 到 S5 的基线路径耗时 23 分钟。施工封闭站台时可把原站登记到临时站点，查询会按生效窗口把步行时间计入路径；窗口结束后自动恢复原站。</p>
 <div class="card"><h2>身份与版本</h2><input id="user" value="planner-01"><select id="role"><option>planner</option><option>reviewer</option><option>admin</option></select><label>版本 ID <input id="version" type="number" value="1"></label><button onclick="refresh()">刷新</button></div>
+<div class="card"><h2>站点迁移登记（草稿）</h2>
+<label>原站 ID <input id="relStop" type="number" value="2" title="车辆不再停靠的原站，如 2=人民广场"></label>
+<label>临时站 ID <input id="relTemp" type="number" value="7" title="如 7=T2 无障碍临时站，8=T7 巷内无台阶临停"></label>
+<label>步行分钟 <input id="relWalk" type="number" value="6" min="0"></label>
+<label>生效开始(分钟) <input id="relStart" type="number" value="480" min="0" max="2879"></label>
+<label>生效结束(分钟) <input id="relEnd" type="number" value="1200" min="0" max="2879"></label>
+<button onclick="addRelocation()">登记迁移到草稿</button>
+<pre id="relResult">等待登记…</pre></div>
 <div class="card"><h2>路径查询</h2><label>起点 <input id="from" type="number" value="1"></label><label>终点 <input id="to" type="number" value="5"></label><label>服务日分钟 <input id="at" type="number" value="1430"></label><label><input id="accessible" type="checkbox">仅无障碍</label><button onclick="routeBase()">基线路径</button><button onclick="routeVersion()">版本路径</button><pre id="routeResult">等待查询…</pre></div>
 <div class="card"><h2>方案状态</h2><button onclick="action('submit')">提交复核</button><button onclick="action('approve')">批准</button><button onclick="action('publish')">发布</button><pre id="stateResult"></pre></div>
 <div class="card"><h2>数据</h2><button onclick="trips()">跨日班次</button><button onclick="errors()">坏数据记录</button><pre id="data">等待操作…</pre></div>
 <script>
 const auth=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
 async function call(url,opts={}){const r=await fetch(url,opts);const j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}
+async function addRelocation(){
+  const body={kind:'stop_relocation',stop_id:Number(relStop.value),to_stop_id:Number(relTemp.value),travel_minutes:Number(relWalk.value),effective_start_minute:Number(relStart.value),effective_end_minute:Number(relEnd.value)};
+  try{relResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/changes',{method:'POST',headers:auth(),body:JSON.stringify(body)}),null,2)}catch(e){relResult.textContent=e.message}
+}
 async function routeBase(){try{routeResult.textContent=JSON.stringify(await call('/api/route?from='+from.value+'&to='+to.value+'&at_minute='+at.value+(accessible.checked?'&accessible=true':'')),null,2)}catch(e){routeResult.textContent=e.message}}
 async function routeVersion(){try{routeResult.textContent=JSON.stringify(await call('/api/route?from='+from.value+'&to='+to.value+'&version_id='+version.value+'&at_minute='+at.value+(accessible.checked?'&accessible=true':'')),null,2)}catch(e){routeResult.textContent=e.message}}
 async function action(name){try{stateResult.textContent=JSON.stringify(await call('/api/versions/'+version.value+'/'+name,{method:'POST',headers:auth(),body:'{}'}),null,2)}catch(e){stateResult.textContent=e.message}}

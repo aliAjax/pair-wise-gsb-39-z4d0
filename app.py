@@ -3,9 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import heapq
 import json
-import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -13,6 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+import rules
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "transit_disruption.db"
@@ -32,14 +32,6 @@ def format_service_time(minutes: int) -> dict[str, Any]:
         raise DomainError("服务时间不能为负")
     day_offset, minute_of_day = divmod(minutes, 1440)
     return {"minutes": minutes, "clock": f"{minute_of_day // 60:02d}:{minute_of_day % 60:02d}", "day_offset": day_offset}
-
-
-def _within_window(value: int, start: int | None, end: int | None) -> bool:
-    if start is None and end is None:
-        return True
-    if start is None or end is None:
-        return False
-    return start <= value <= end
 
 
 class DomainError(Exception):
@@ -120,7 +112,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS changes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     version_id INTEGER NOT NULL REFERENCES versions(id) ON DELETE CASCADE,
-                    kind TEXT NOT NULL CHECK(kind IN ('stop_closure','skip_stop','detour','accessibility_change')),
+                    kind TEXT NOT NULL CHECK(kind IN ('stop_closure','skip_stop','detour','accessibility_change','stop_relocation')),
                     line_id INTEGER REFERENCES lines(id),
                     stop_id INTEGER REFERENCES stops(id),
                     from_stop_id INTEGER REFERENCES stops(id),
@@ -298,7 +290,7 @@ class Database:
         if role not in {"planner", "editor", "admin"}:
             raise DomainError("没有修改方案的权限", 403)
         kind = str(payload.get("kind", "")).strip()
-        if kind not in {"stop_closure", "skip_stop", "detour", "accessibility_change"}:
+        if kind not in rules.CHANGE_KINDS:
             raise DomainError("变更类型不合法")
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -312,25 +304,41 @@ class Database:
             from_stop_id = payload.get("from_stop_id")
             to_stop_id = payload.get("to_stop_id")
             travel = payload.get("travel_minutes")
-            start = payload.get("effective_start_minute")
-            end = payload.get("effective_end_minute")
             if line_id is not None and not conn.execute("SELECT 1 FROM lines WHERE id=?", (int(line_id),)).fetchone():
                 raise DomainError("线路不存在", 404)
             for candidate in (stop_id, from_stop_id, to_stop_id):
                 if candidate is not None and not conn.execute("SELECT 1 FROM stops WHERE id=?", (int(candidate),)).fetchone():
                     raise DomainError("站点不存在", 404)
-            if kind in {"stop_closure", "skip_stop", "accessibility_change"} and stop_id is None:
+            if kind in {"stop_closure", "skip_stop", "accessibility_change", "stop_relocation"} and stop_id is None:
                 raise DomainError("该变更需要 stop_id")
             if kind == "detour" and (from_stop_id is None or to_stop_id is None or travel is None):
                 raise DomainError("绕行需要起止站点和行驶分钟数")
             if travel is not None and int(travel) < 0:
                 raise DomainError("行驶时间不能为负")
-            if (start is None) != (end is None):
-                raise DomainError("生效开始和结束时间必须同时提供")
-            if start is not None:
-                start, end = int(start), int(end)
-                if start < 0 or end <= start or end >= 2880:
-                    raise DomainError("生效时间范围不合法")
+            if kind == "stop_relocation":
+                try:
+                    normalized = rules.validate_relocation(
+                        payload,
+                        lambda sid: conn.execute("SELECT 1 FROM stops WHERE id=?", (sid,)).fetchone() is not None,
+                    )
+                except LookupError as exc:
+                    raise DomainError("站点不存在", 404) from exc
+                except ValueError as exc:
+                    raise DomainError(str(exc)) from exc
+                stop_id = normalized["stop_id"]
+                to_stop_id = normalized["to_stop_id"]
+                travel = normalized["travel_minutes"]
+                start, end = normalized["effective_start_minute"], normalized["effective_end_minute"]
+            else:
+                if (payload.get("effective_start_minute") is None) != (payload.get("effective_end_minute") is None):
+                    raise DomainError("生效开始和结束时间必须同时提供")
+                start = payload.get("effective_start_minute")
+                end = payload.get("effective_end_minute")
+                if start is not None:
+                    try:
+                        start, end = rules.normalize_window(start, end)
+                    except ValueError as exc:
+                        raise DomainError(str(exc)) from exc
             accessible = payload.get("accessible")
             if kind == "accessibility_change" and not isinstance(accessible, bool):
                 raise DomainError("无障碍变更需要布尔值 accessible")
@@ -391,58 +399,19 @@ class Database:
         trips = [dict(r) for r in conn.execute("SELECT * FROM trips ORDER BY id")]
         return hashlib.sha256(canonical({"lines": lines, "stops": stops, "line_stops": memberships, "trips": trips}).encode()).hexdigest()
 
-    def _graph(self, version_id: int | None, at_minute: int, require_accessible: bool) -> tuple[dict[int, list[tuple[int, int, dict[str, Any]]]], dict[int, sqlite3.Row]]:
+    def _graph(self, version_id: int | None, at_minute: int, require_accessible: bool) -> tuple[dict[int, list[tuple[int, int, dict[str, Any]]]], dict[int, dict[str, Any]]]:
         with self.connect() as conn:
-            stops = {int(r["id"]): r for r in conn.execute("SELECT * FROM stops")}
-            memberships: dict[int, list[sqlite3.Row]] = {}
+            stops = {int(r["id"]): dict(r) for r in conn.execute("SELECT * FROM stops")}
+            memberships: dict[int, list[dict[str, Any]]] = {}
             for row in conn.execute("SELECT * FROM line_stops ORDER BY line_id,sequence"):
-                memberships.setdefault(int(row["line_id"]), []).append(row)
-            active: list[sqlite3.Row] = []
+                memberships.setdefault(int(row["line_id"]), []).append(dict(row))
+            changes: list[dict[str, Any]] = []
             if version_id is not None:
                 version = conn.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone()
                 if not version:
                     raise DomainError("方案版本不存在", 404)
-                active = conn.execute("SELECT * FROM changes WHERE version_id=?", (version_id,)).fetchall()
-            closed: set[int] = set()
-            inaccessible: set[int] = set()
-            detours: list[sqlite3.Row] = []
-            for change in active:
-                if not _within_window(at_minute, change["effective_start_minute"], change["effective_end_minute"]):
-                    continue
-                if change["kind"] in {"stop_closure", "skip_stop"}:
-                    closed.add(int(change["stop_id"]))
-                elif change["kind"] == "accessibility_change" and not bool(change["accessible"]):
-                    inaccessible.add(int(change["stop_id"]))
-                elif change["kind"] == "detour":
-                    detours.append(change)
-            graph: dict[int, list[tuple[int, int, dict[str, Any]]]] = {sid: [] for sid in stops}
-            for line_id, rows in memberships.items():
-                if not rows:
-                    continue
-                # Vehicles may pass a skipped or closed stop but passengers
-                # cannot board or alight there. Build one edge between each
-                # pair of usable stops and accumulate all omitted segment time.
-                usable = [
-                    row for row in rows
-                    if int(row["stop_id"]) not in closed
-                    and not (require_accessible and (not stops[int(row["stop_id"])]["accessible"] or int(row["stop_id"]) in inaccessible))
-                ]
-                for current, nxt in zip(usable, usable[1:]):
-                    between = [r for r in rows if int(current["sequence"]) < int(r["sequence"]) <= int(nxt["sequence"])]
-                    minutes = sum(int(r["travel_minutes_from_previous"]) for r in between)
-                    edge = {"line_id": line_id, "kind": "route", "from_sequence": current["sequence"], "to_sequence": nxt["sequence"]}
-                    graph[int(current["stop_id"])].append((int(nxt["stop_id"]), minutes, edge))
-                    reverse_edge = {"line_id": line_id, "kind": "route", "from_sequence": nxt["sequence"], "to_sequence": current["sequence"]}
-                    graph[int(nxt["stop_id"])].append((int(current["stop_id"]), minutes, reverse_edge))
-            for change in detours:
-                src, dst, minutes = int(change["from_stop_id"]), int(change["to_stop_id"]), int(change["travel_minutes"])
-                if src in closed or dst in closed:
-                    continue
-                if require_accessible and (not stops[src]["accessible"] or not stops[dst]["accessible"] or src in inaccessible or dst in inaccessible):
-                    continue
-                graph[src].append((dst, minutes, {"line_id": change["line_id"], "kind": "detour", "change_id": change["id"]}))
-                graph[dst].append((src, minutes, {"line_id": change["line_id"], "kind": "detour", "change_id": change["id"]}))
-            return graph, stops
+                changes = [dict(r) for r in conn.execute("SELECT * FROM changes WHERE version_id=?", (version_id,)).fetchall()]
+        return rules.build_graph(stops, memberships, changes, at_minute, require_accessible), stops
 
     def route(self, from_stop_id: int, to_stop_id: int, version_id: int | None = None,
               at_minute: int = 0, require_accessible: bool = False) -> dict[str, Any]:
@@ -453,35 +422,11 @@ class Database:
             raise DomainError("起讫站点不存在", 404)
         if require_accessible and not stops[from_stop_id]["accessible"]:
             raise DomainError("起点不具备无障碍通行条件", 409)
-        queue: list[tuple[int, int]] = [(0, from_stop_id)]
-        distance = {from_stop_id: 0}
-        predecessor: dict[int, tuple[int, dict[str, Any]]] = {}
-        while queue:
-            cost, node = heapq.heappop(queue)
-            if cost != distance.get(node):
-                continue
-            if node == to_stop_id:
-                break
-            for nxt, weight, edge in graph.get(node, []):
-                new_cost = cost + weight
-                if new_cost < distance.get(nxt, math.inf):
-                    distance[nxt] = new_cost
-                    predecessor[nxt] = (node, edge)
-                    heapq.heappush(queue, (new_cost, nxt))
-        if to_stop_id not in distance:
+        minutes, path, legs = rules.shortest_path(graph, from_stop_id, to_stop_id)
+        if minutes is None:
             return {"from_stop_id": from_stop_id, "to_stop_id": to_stop_id, "minutes": None, "path": [], "legs": [], "status": "unreachable"}
-        path = [to_stop_id]
-        legs: list[dict[str, Any]] = []
-        cursor = to_stop_id
-        while cursor != from_stop_id:
-            previous, edge = predecessor[cursor]
-            legs.append({"from_stop_id": previous, "to_stop_id": cursor, "minutes": distance[cursor] - distance[previous], **edge})
-            path.append(previous)
-            cursor = previous
-        path.reverse()
-        legs.reverse()
-        return {"from_stop_id": from_stop_id, "to_stop_id": to_stop_id, "minutes": distance[to_stop_id], "path": path,
-                "legs": legs, "status": "ok", "arrival": format_service_time(at_minute + distance[to_stop_id])}
+        return {"from_stop_id": from_stop_id, "to_stop_id": to_stop_id, "minutes": minutes, "path": path,
+                "legs": legs, "status": "ok", "arrival": format_service_time(at_minute + minutes)}
 
     def trip_times(self, trip_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -558,6 +503,8 @@ def seed_demo(db: Database) -> dict[str, int]:
             {"code": "S4", "name": "码头", "latitude": 31.03, "longitude": 121.03, "accessible": True},
             {"code": "S5", "name": "机场", "latitude": 31.04, "longitude": 121.04, "accessible": True},
             {"code": "X1", "name": "会展中心", "latitude": 31.015, "longitude": 121.025, "accessible": True},
+            {"code": "T2", "name": "人民广场（施工临时站·无障碍）", "latitude": 31.011, "longitude": 121.012, "accessible": True},
+            {"code": "T7", "name": "人民广场（巷内临停·无台阶）", "latitude": 31.009, "longitude": 121.008, "accessible": False},
         ],
         "line_stops": [
             {"line_code": "L1", "stop_code": "S1", "sequence": 0, "travel_minutes_from_previous": 0},
